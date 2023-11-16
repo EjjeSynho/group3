@@ -7,27 +7,20 @@ import numpy as np
 import matplotlib.pyplot as plt
 from torchvision import transforms
 from PIL import Image
+import cupy as cp
 
+from astropy.io import fits
 
 device = torch.device('cuda') if torch.cuda.is_available else torch.device('cpu')
 
+from Zernike import mask_circle, Zernike
 
-def mask_circle(N, r, center=(0,0), centered=True):
-    factor = 0.5 * (1-N%2)
-    if centered:
-        coord_range = np.linspace(-N//2+N%2+factor, N//2-factor, N)
-    else:
-        coord_range = np.linspace(0, N-1, N)
-    xx, yy = np.meshgrid(coord_range-center[1], coord_range-center[0])
-    pupil_round = np.zeros([N, N], dtype=np.int32)
-    pupil_round[np.sqrt(yy**2+xx**2) < r] = 1
-    return pupil_round
-
-
+#%%
 def load_image_as_phase_screen(image_path, sampling=64):
     image = Image.open(image_path).resize((sampling,)*2).convert('L')
     transform = transforms.ToTensor()
     return transform(image)
+
 
 def apply_ao_correction(phase_screen, cutoff_radius):
     # Fourier transform
@@ -52,9 +45,9 @@ def apply_ao_correction(phase_screen, cutoff_radius):
     return corrected_image.abs()
 
 
-N_pupil = 128
+N_pupil = 256
 
-inp_phase  = load_image_as_phase_screen('./test_im.jpg', 128)
+inp_phase  = load_image_as_phase_screen('./test_im.jpg', N_pupil)
 inp_phase -= inp_phase.mean()
 inp_phase  = inp_phase.to(device) * 512
 
@@ -65,15 +58,18 @@ plt.show()
 plt.imshow(corrected_phase[0].cpu())
 plt.show()
 
+pupil = torch.tensor( mask_circle(N_pupil, N_pupil//2)[None,...] ).to(device).float()
+
 #%%
-pupil = torch.tensor( mask_circle(128, 64)[None,...] ).to(device).float()
+Z_basis = Zernike(500, 64, gpu=False)
 
-#%
-f = 600 # [m]
-pixel_size = 24e-6 # [m]
 
-λ = 1000e-9 # [m]
-D = 8.1 # [m]
+#%%
+f = 400 # [m]
+pixel_size = 16e-6 # [m]
+
+λ = 700e-9 # [m]
+D = 8 # [m]
 img_size = 64 # [pixels]
 oversampling = 2 # []
 
@@ -102,16 +98,39 @@ def OPD2PSF(λ, OPD, φ_size, padder, oversampling):
     return PSF
 
 
+#%%
+# Load .fits file
+def load_fits_as_phase_screen(fits_path):
+    # Load FITS file
+    with fits.open(fits_path) as hdul:
+        data = hdul[0].data
+    
+    # Ensure the data is in native byte order
+    if data.dtype.byteorder not in ('=', '|'):
+        data = data.byteswap().newbyteorder()
+
+    # Convert to PyTorch tensor
+    tensor = torch.from_numpy(data).float()
+    tensor = tensor.unsqueeze(0)  # Add a channel dimension
+    return tensor
+
+X = load_fits_as_phase_screen('./phase_screen.fits')
+X = X * 700.0 / 2 / np.pi # [nm]
+
+X = X.to(device)
+#%%
+
 def GetPSF(phase_cube):
     return OPD2PSF(λ, phase_cube, φ_size, padder, oversampling)
     
-PSF_0 = GetPSF(inp_phase)
-PSF_1 = GetPSF(corrected_phase)
+# PSF_0 = GetPSF(inp_phase)
+PSF_0 = GetPSF(-X)
+# PSF_1 = GetPSF(corrected_phase)
 
 plt.imshow(torch.log(PSF_0[0].abs().cpu()))
 plt.show()
-plt.imshow(torch.log(PSF_1[0].abs().cpu()))
-plt.show()
+# plt.imshow(torch.log(PSF_1[0].abs().cpu()))
+# plt.show()
 
 #%%
 # Apply AO correction
